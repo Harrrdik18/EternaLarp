@@ -19,6 +19,46 @@ CREATE TABLE trend_examples (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tren
 CREATE TABLE trend_saves (organization_id uuid NOT NULL REFERENCES organizations ON DELETE CASCADE, trend_id uuid NOT NULL REFERENCES trends ON DELETE CASCADE, saved_by uuid NOT NULL REFERENCES users, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(organization_id,trend_id));
 CREATE INDEX trends_active_momentum ON trends(status,momentum DESC,expires_at) WHERE status <> 'DEAD';
 
+-- Curated meme catalog. Add one row per reusable meme / engagement format.
+CREATE TABLE memes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  trend_id uuid REFERENCES trends ON DELETE SET NULL,
+  title text NOT NULL,
+  slug text NOT NULL UNIQUE,
+  format text NOT NULL,
+  category text NOT NULL DEFAULT 'Meme',
+  description text NOT NULL DEFAULT '',
+  origin text,
+  source_url text,
+  platforms text[] NOT NULL DEFAULT '{}',
+  audience text NOT NULL DEFAULT '',
+  keywords text[] NOT NULL DEFAULT '{}',
+  engagement_prompt text NOT NULL DEFAULT '',
+  example_caption text,
+  industries_good text[] NOT NULL DEFAULT '{}',
+  industries_avoid text[] NOT NULL DEFAULT '{}',
+  brand_safe boolean NOT NULL DEFAULT true,
+  status text NOT NULL DEFAULT 'RISING' CHECK (status IN ('HOT','RISING','PEAKING','COOLING','DEAD')),
+  popularity smallint NOT NULL DEFAULT 0 CHECK (popularity BETWEEN 0 AND 100),
+  momentum smallint NOT NULL DEFAULT 0 CHECK (momentum BETWEEN 0 AND 100),
+  estimated_lifespan_hours integer,
+  starts_at timestamptz,
+  expires_at timestamptz,
+  reference_image_url text,
+  notes text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX memes_active_momentum ON memes(status,momentum DESC,expires_at) WHERE status <> 'DEAD';
+CREATE INDEX memes_platforms_gin ON memes USING gin(platforms);
+-- Optional editorial knowledge used by MemeMatcher; existing catalog rows remain valid.
+ALTER TABLE memes ADD COLUMN IF NOT EXISTS emotions text[] NOT NULL DEFAULT '{}';
+ALTER TABLE memes ADD COLUMN IF NOT EXISTS tones text[] NOT NULL DEFAULT '{}';
+ALTER TABLE memes ADD COLUMN IF NOT EXISTS use_cases text[] NOT NULL DEFAULT '{}';
+ALTER TABLE memes ADD COLUMN IF NOT EXISTS avoid_situations text[] NOT NULL DEFAULT '{}';
+ALTER TABLE memes ADD COLUMN IF NOT EXISTS content_formats text[] NOT NULL DEFAULT '{}';
+ALTER TABLE memes ADD COLUMN IF NOT EXISTS communities text[] NOT NULL DEFAULT '{}';
+
 CREATE TABLE content_opportunities (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), organization_id uuid NOT NULL REFERENCES organizations ON DELETE CASCADE, trend_id uuid NOT NULL REFERENCES trends, angle text NOT NULL, platform text NOT NULL, reasoning text NOT NULL, engagement_potential smallint NOT NULL CHECK(engagement_potential BETWEEN 0 AND 100), risk_level text NOT NULL, suggested_format text NOT NULL, score smallint NOT NULL CHECK(score BETWEEN 0 AND 100), created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE media_assets (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), organization_id uuid NOT NULL REFERENCES organizations ON DELETE CASCADE, created_by uuid REFERENCES users, storage_key text NOT NULL, mime_type text NOT NULL, width integer, height integer, alt_text text, metadata jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE brand_profiles ADD CONSTRAINT brand_logo_asset_fk FOREIGN KEY (logo_asset_id) REFERENCES media_assets ON DELETE SET NULL;
