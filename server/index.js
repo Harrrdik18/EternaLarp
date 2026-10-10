@@ -2,7 +2,8 @@ import { createServer } from 'node:http'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, randomBytes, createHash, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
+import { promisify } from 'node:util'
 import { Pool } from 'pg'
 
 const port = Number(process.env.API_PORT || 3001)
@@ -13,6 +14,9 @@ const connectionString = process.env.DATABASE_URL || (password
 if (!connectionString) throw new Error('Set DATABASE_URL or POSTGRES_PASSWORD in .env')
 
 const pool = new Pool({ connectionString, max: process.env.VERCEL === '1' ? 1 : 5, connectionTimeoutMillis: 4000 })
+const scrypt = promisify(scryptCallback)
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
+const sessionCookie = process.env.VERCEL === '1' ? '__Host-signal_session' : 'signal_session'
 const uploadDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../uploads')
 if (process.env.VERCEL !== '1') await mkdir(uploadDir, { recursive: true })
 const columns = new Set([
@@ -86,6 +90,44 @@ function routeMatch(path) {
   const match = path.match(/^\/api\/memes\/([0-9a-f-]{36})$/i)
   return match?.[1] || null
 }
+function parseCookies(req) {
+  return Object.fromEntries(String(req.headers?.cookie || '').split(';').map(part => part.trim()).filter(Boolean).map(part => {
+    const index = part.indexOf('=')
+    try { return [part.slice(0,index), decodeURIComponent(part.slice(index+1))] } catch { return ['', ''] }
+  }).filter(([key]) => key))
+}
+function hashToken(token) { return createHash('sha256').update(token).digest('hex') }
+function setSessionCookie(res, token, maxAge = SESSION_TTL_SECONDS) {
+  const secure = process.env.VERCEL === '1' ? '; Secure' : ''
+  res.setHeader('set-cookie', `${sessionCookie}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`)
+}
+async function issueSession(userId, res) {
+  const token = randomBytes(32).toString('base64url')
+  const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000)
+  await pool.query('DELETE FROM auth_sessions WHERE expires_at < now()')
+  await pool.query('INSERT INTO auth_sessions(token_hash,user_id,expires_at) VALUES($1,$2,$3)', [hashToken(token), userId, expiresAt])
+  setSessionCookie(res, token)
+}
+async function authenticatedUser(req) {
+  const token = parseCookies(req)[sessionCookie]
+  if (!token) return null
+  const { rows } = await pool.query(`SELECT u.id,u.email,u.display_name,u.role,s.token_hash FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()`, [hashToken(token)])
+  return rows[0] || null
+}
+async function passwordHash(password) {
+  const salt = randomBytes(16).toString('base64url')
+  const hash = await scrypt(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
+  return `scrypt$${salt}$${Buffer.from(hash).toString('base64url')}`
+}
+async function passwordMatches(password, stored) {
+  if (!stored) return false
+  const [algorithm,salt,encoded] = stored.split('$')
+  if (algorithm !== 'scrypt' || !salt || !encoded) return false
+  const expected = Buffer.from(encoded, 'base64url')
+  const actual = Buffer.from(await scrypt(password, salt, expected.length, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }))
+  return expected.length === actual.length && timingSafeEqual(expected, actual)
+}
+function publicUser(user) { return { id:user.id, email:user.email, display_name:user.display_name, role:user.role || 'viewer' } }
 
 export async function handleApiRequest(req, res) {
   const url = new URL(req.url || '/', 'http://127.0.0.1')
@@ -93,6 +135,54 @@ export async function handleApiRequest(req, res) {
     if (req.method === 'GET' && url.pathname === '/api/health') {
       await pool.query('SELECT 1')
       return send(res, 200, { ok: true, database: 'connected' })
+    }
+    if (req.method === 'GET' && url.pathname === '/api/auth/session') {
+      const user = await authenticatedUser(req)
+      return send(res, 200, { user: user ? publicUser(user) : null })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/signup') {
+      const input = await readBody(req)
+      const displayName = String(input.displayName || '').trim()
+      const email = String(input.email || '').trim().toLowerCase()
+      const password = String(input.password || '')
+      if (displayName.length < 2 || displayName.length > 100) return send(res, 400, { error:'Enter a name between 2 and 100 characters.' })
+      if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return send(res, 400, { error:'Enter a valid email address.' })
+      if (password.length < 10 || password.length > 128) return send(res, 400, { error:'Password must be between 10 and 128 characters.' })
+      const hash = await passwordHash(password)
+      const client = await pool.connect()
+      let user
+      try {
+        await client.query('BEGIN')
+        await client.query('SELECT pg_advisory_xact_lock(824661981)')
+        const { rows:existing } = await client.query("SELECT EXISTS(SELECT 1 FROM users WHERE role IN ('owner','admin')) AS has_owner")
+        const role = existing[0].has_owner ? 'viewer' : 'owner'
+        const { rows } = await client.query('INSERT INTO users(email,display_name,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id,email,display_name,role', [email, displayName, hash, role])
+        user = rows[0]
+        await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+      await issueSession(user.id, res)
+      return send(res, 201, { user:publicUser(user) })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+      const input = await readBody(req)
+      const email = String(input.email || '').trim().toLowerCase()
+      const password = String(input.password || '')
+      const { rows } = await pool.query('SELECT id,email,display_name,password_hash,role FROM users WHERE email=$1', [email])
+      if (!rows[0] || !(await passwordMatches(password, rows[0].password_hash))) return send(res, 401, { error:'Email or password is incorrect.' })
+      await issueSession(rows[0].id, res)
+      return send(res, 200, { user:publicUser(rows[0]) })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+      const token = parseCookies(req)[sessionCookie]
+      if (token) await pool.query('DELETE FROM auth_sessions WHERE token_hash=$1', [hashToken(token)])
+      setSessionCookie(res, '', 0)
+      return send(res, 200, { ok:true })
+    }
+    const publicAuthRoute = url.pathname.startsWith('/api/auth/')
+    if (!publicAuthRoute && url.pathname !== '/api/health') {
+      const user = await authenticatedUser(req)
+      if (!user) return send(res, 401, { error:'Sign in to continue.' })
+      req.authUser = publicUser(user)
     }
     if (req.method === 'POST' && url.pathname === '/api/uploads') {
       const { filename, mimeType, data } = await readBody(req, 12_000_000)
@@ -171,6 +261,7 @@ export async function handleApiRequest(req, res) {
       return send(res, 200, { title: `${meme.title} · ${brand || 'Your brand'}`, copy, format: meme.format })
     }
     if (req.method === 'POST' && url.pathname === '/api/memes') {
+      if (!['owner','admin'].includes(req.authUser?.role)) return send(res, 403, { error:'An owner or admin account is required to edit the meme catalog.' })
       const row = normalize(await readBody(req))
       const { keys, values } = valuesFor(row)
       const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ')
@@ -183,6 +274,7 @@ export async function handleApiRequest(req, res) {
       return rows[0] ? send(res, 200, rows[0]) : send(res, 404, { error: 'Meme not found' })
     }
     if (id && req.method === 'PATCH') {
+      if (!['owner','admin'].includes(req.authUser?.role)) return send(res, 403, { error:'An owner or admin account is required to edit the meme catalog.' })
       const row = normalize(await readBody(req), { partial: true })
       const { keys, values } = valuesFor(row)
       if (!keys.length) return send(res, 400, { error: 'No editable fields were supplied' })
@@ -191,11 +283,14 @@ export async function handleApiRequest(req, res) {
       return rows[0] ? send(res, 200, rows[0]) : send(res, 404, { error: 'Meme not found' })
     }
     if (id && req.method === 'DELETE') {
+      if (!['owner','admin'].includes(req.authUser?.role)) return send(res, 403, { error:'An owner or admin account is required to edit the meme catalog.' })
       const { rowCount } = await pool.query('DELETE FROM memes WHERE id = $1', [id])
       return rowCount ? send(res, 200, { deleted: true }) : send(res, 404, { error: 'Meme not found' })
     }
     send(res, 404, { error: 'Route not found' })
   } catch (error) {
+    console.error('Signal API request failed', { path:url.pathname, code:error.code || 'UNKNOWN', message:String(error.message || 'Unknown error').slice(0,300) })
+    if (error.code === '23505' && url.pathname === '/api/auth/signup') return send(res, 409, { error:'An account with that email already exists. Sign in instead.' })
     if (error.code === '23505') return send(res, 409, { error: 'That slug is already in use. Change it or use a distinct title.' })
     if (error.code === '23514' || error.code === '22P02') return send(res, 400, { error: 'One or more fields are invalid.' })
     send(res, error.status || 500, { error: error.status ? error.message : 'Database request failed. Check that PostgreSQL is running.' })

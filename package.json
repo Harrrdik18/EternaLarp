@@ -11,6 +11,7 @@
     "preview": "vite preview --host 0.0.0.0",
     "db:up": "docker compose up -d db",
     "db:seed": "node --env-file=.env scripts/seed-memes.js",
+    "db:migrate:auth": "node --env-file=.env scripts/migrate-auth.js",
     "db:down": "docker compose down",
     "db:psql": "docker compose exec db psql -U signal -d signal_studio"
   },

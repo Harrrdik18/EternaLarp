@@ -16,6 +16,8 @@ npm run dev
 
 Open the app at the Vite URL shown in the terminal. Use **Admin · Memes** in the sidebar to add, edit, search, filter, or delete meme records. Meme fields are saved directly to the PostgreSQL `memes` table. Reference images can be uploaded (PNG, JPEG, WebP, or GIF; up to 8 MB); the database stores the image URL and the local API stores image files in the ignored `uploads/` directory. `Admin · Trends` remains the separate browser-based editorial trend workspace. The API and Vite development server bind to localhost.
 
+Email/password accounts use persistent, HTTP-only cookies and PostgreSQL-backed sessions. Run `npm run db:migrate:auth` against the target database before deploying the auth UI/API. The first registered account is the workspace owner; later signups are viewers. Sign-in does not yet include email verification or self-serve password reset because no mail provider is configured.
+
 Run `npm run db:seed` to add or refresh the curated meme knowledge examples. The seed is repeatable and only upserts its own slugs. The **Find a meme** workspace matches a communication context against the catalog, explains its leading matches, and creates a format-aware concept that can be opened in Visual Studio. Admin → Memes stores editorial use cases, emotions, tones, content formats, communities, and avoid guidance alongside each existing record.
 
 The database is `signal_studio`, the local user is `signal`, and Postgres listens only on `127.0.0.1:5432`. `server/schema.sql` initializes the SaaS schema and meme catalog the first time the database volume is created. `npm run db:psql` opens a SQL prompt, and `npm run db:down` stops the database while preserving its data volume.
@@ -27,6 +29,7 @@ The Vite frontend builds to `dist/`; Vercel Functions in `api/` serve the Postgr
 - Create a Vercel Blob store; `api/uploads/` issues direct browser-upload tokens, so image bytes do not pass through a function body or get written to ephemeral disk.
 - Configure the Blob token in Vercel project settings. Uploaded image URLs are saved in the meme row.
 - Apply `server/schema.sql` to the hosted database before using the admin panel.
+- Set `DATABASE_URL` for Preview and Production, run `npm run db:migrate:auth` against that same database, then redeploy. Sign-in uses the `api/auth/[action].js` Vercel function and a `Secure`, `HttpOnly`, `SameSite=Lax` cookie.
 
 The current app and API do not yet implement user authentication or tenant authorization. Keep a deployment private until access control is added; the serverless conversion by itself does not secure the admin endpoints.
 ## Production boundaries
