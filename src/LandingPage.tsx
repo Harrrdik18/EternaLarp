@@ -39,7 +39,7 @@ export default function LandingPage({ onStart, onFindMeme }: Props) {
           <div className="match-context"><span className="match-step">YOUR CONTEXT</span><p>“I made a video about mistakes new YouTubers make.”</p><div className="context-meta"><span><CircleHelp size={12}/> Looking for a relatable format</span><span>Creator content</span></div></div>
           <div className="match-result-head"><span className="match-step">TOP FORMAT MATCH</span><span className="match-score">94<small> / 100</small></span></div>
           <div className="meme-result">
-            <div className="meme-art" aria-hidden="true"><div className="meme-panel meme-reject"><span>✕</span><div className="meme-figure"><i/><b/></div><small>BUYING EXPENSIVE GEAR<br/>BEFORE UPLOADING</small></div><div className="meme-panel meme-approve"><span>✓</span><div className="meme-figure"><i/><b/></div><small>ACTUALLY PUBLISHING<br/>YOUR FIRST VIDEO</small></div></div>
+            <a className="meme-art meme-art-real" href="https://imgflip.com/meme/Drake-Hotline-Bling" target="_blank" rel="noreferrer" aria-label="View the Drake Hotline Bling meme template on Imgflip"><img src="https://i.imgflip.com/4/30b1gx.jpg" alt="Drake Hotline Bling two-panel meme template" loading="lazy" /></a>
             <div className="meme-result-caption"><strong>Drake Hotline Bling</strong><span>Two-panel reaction · Works for contrast</span></div>
           </div>
           <div className="match-why"><span className="why-icon"><Sparkles size={14}/></span><p>Works well for contrasting what new creators think matters with what actually helps them grow.</p></div>

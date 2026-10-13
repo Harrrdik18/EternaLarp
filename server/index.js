@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID, randomBytes, createHash, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import { Pool } from 'pg'
+import { generateConcept, matchMemesIntentFreshness } from './meme-matcher.js'
+import { interpretContext, generateConceptVariations } from './ai/service.js'
+import { deterministicVariations } from './ai/concept-fallback.js'
 
 const port = Number(process.env.API_PORT || 3001)
 const password = process.env.POSTGRES_PASSWORD
@@ -218,47 +221,40 @@ export async function handleApiRequest(req, res) {
     }
     if (req.method === 'POST' && url.pathname === '/api/memes/match') {
       const input = await readBody(req)
+      if (!input || typeof input !== 'object' || Array.isArray(input)) return send(res, 400, { error: 'Brief details must be sent as a JSON object.' })
       if (typeof input.context !== 'string' || input.context.trim().length < 8) return send(res, 400, { error: 'Describe what you are trying to communicate (at least 8 characters).' })
-      const { rows } = await pool.query("SELECT * FROM memes WHERE status <> 'DEAD' ORDER BY updated_at DESC")
-      const words = text => new Set(String(text || '').toLowerCase().match(/[a-z0-9]{3,}/g) || [])
-      const contextWords = words([input.context,input.audience,input.goal,input.tone,input.industry].join(' '))
-      const ranked = rows.map(meme => {
-        const metadata = words([meme.title,meme.description,meme.category,meme.format,meme.audience,meme.keywords,meme.use_cases,meme.content_formats,meme.communities,meme.industries_good].join(' '))
-        const overlap = [...contextWords].filter(w => metadata.has(w)).length
-        const contextFit = Math.min(98, 48 + overlap * 8)
-        const audienceFit = input.audience && `${meme.audience} ${meme.communities}`.toLowerCase().includes(String(input.audience).toLowerCase()) ? 96 : input.audience ? 72 : 82
-        const toneFit = input.tone && (meme.tones || []).some(t => t.toLowerCase() === String(input.tone).toLowerCase()) ? 96 : 80
-        const formatFit = overlap ? Math.min(96, 68 + overlap * 5) : 70
-        const platformFit = input.platform ? (meme.platforms || []).some(p => p.toLowerCase() === String(input.platform).toLowerCase()) ? 96 : 62 : 82
-        const industryFit = input.industry ? (meme.industries_good || []).some(i => i.toLowerCase().includes(String(input.industry).toLowerCase())) ? 96 : (meme.industries_avoid || []).some(i => String(input.industry).toLowerCase().includes(i.toLowerCase())) ? 35 : 76 : 82
-        const relevance = (contextFit * .34 + audienceFit * .13 + toneFit * .12 + formatFit * .18 + platformFit * .1 + industryFit * .13)
-        const momentumBoost = meme.status === 'DEAD' || relevance < 70 ? 0 : Math.min(4, Number(meme.momentum || 0) / 25)
-        const score = Math.round(Math.min(98, relevance + momentumBoost))
-        const reasons = []
-        if (overlap) reasons.push(`Its ${meme.format.toLowerCase()} format connects with details in your context.`)
-        if (input.audience) reasons.push(`It can speak to ${input.audience} through ${meme.audience || 'a broad audience'}.`)
-        if (input.platform && (meme.platforms || []).includes(input.platform)) reasons.push(`It is a natural fit for ${input.platform}.`)
-        if (meme.industries_avoid?.some(i => input.industry && input.industry.toLowerCase().includes(i.toLowerCase()))) reasons.push(`Use care: ${input.industry} is listed as an industry to avoid.`)
-        if (!reasons.length) reasons.push('This format is broadly adaptable; tailor the setup to your specific situation.')
-        return { meme, score, dimensions: { context:Math.round(contextFit), audience:Math.round(audienceFit), tone:Math.round(toneFit), format:Math.round(formatFit), platform:Math.round(platformFit), brand:Math.round(industryFit), trend:Math.round(meme.momentum || 0) }, reasons, strengths: [meme.format, ...(meme.content_formats || []).slice(0,2), ...(meme.use_cases || []).slice(0,2)], weaknesses: meme.industries_avoid || [], suggestedUse: meme.example_caption || meme.engagement_prompt || `Use ${meme.format.toLowerCase()} to make your point about ${input.context.trim().replace(/[.!?]$/,'')}.` }
-      }).filter(r => r.score >= 50).sort((a,b) => b.score-a.score).slice(0,6)
-      return send(res, 200, { recommendations: ranked })
+      if (input.context.length > 4000 || ['audience','goal','tone','platform','industry'].some(key => input[key] != null && (typeof input[key] !== 'string' || input[key].length > 200))) return send(res, 400, { error: 'Keep the brief and each structured field under 4,000 and 200 characters respectively.' })
+      let ai
+      try { ai = await interpretContext(input, { userScope: req.authUser?.id || hashToken(parseCookies(req)[sessionCookie] || req.socket?.remoteAddress || 'anonymous') }) }
+      catch { console.info('signal-ai', JSON.stringify({ task:'interpretation', result:'fallback_guard' })); ai = { interpretation:null, status:'unavailable', used:false } }
+      const interpreted = ai.interpretation ? { ...input, ...ai.interpretation, audience: input.audience || ai.interpretation.audience, tone: input.tone || ai.interpretation.tone, platform: input.platform || ai.interpretation.platform, industry: input.industry || ai.interpretation.industry, goal: input.goal || ai.interpretation.intent } : input
+      const { rows } = await pool.query(`SELECT * FROM memes WHERE status <> 'DEAD'
+        AND ($1::text IS NULL OR cardinality(platforms)=0 OR $1=ANY(platforms))
+        AND ($2::text IS NULL OR NOT EXISTS (SELECT 1 FROM unnest(industries_avoid) x WHERE lower($2) LIKE '%' || lower(x) || '%' OR lower(x) LIKE '%' || lower($2) || '%'))
+        ORDER BY updated_at DESC LIMIT 300`, [interpreted.platform || null, interpreted.industry || null])
+      return send(res, 200, { recommendations: matchMemesIntentFreshness(interpreted, rows), ai: { status: ai.status, assisted: ai.used === true } })
     }
     if (req.method === 'POST' && url.pathname === '/api/memes/concept') {
-      const { meme, context, brand } = await readBody(req)
-      if (!meme || typeof context !== 'string') return send(res, 400, { error: 'Meme and context are required.' })
-      const topic = context.trim().replace(/[.!?]$/,'')
-      const fmt = `${meme.format || ''} ${(meme.content_formats || []).join(' ')}`.toLowerCase()
-      const durations = topic.match(/\b\d+(?:\.\d+)?\s*(?:minutes?|mins?|hours?|days?|seconds?|secs?|s|m|h)\b/gi) || []
-      const isImprovement = /reduc|cut|faster|from .+ to|automati|finally|shipped|launch/i.test(topic)
-      let copy
-      if (durations.length >= 2 && isImprovement) copy = `❌ Before: Waiting ${durations[0]} for a deployment.\n\n✅ After: Watching it finish in ${durations[1]}.`
-      else if (fmt.includes('expectation') || fmt.includes('reality')) copy = `EXPECTATION\n${topic}\n\nREALITY\nThe messy, relatable part nobody puts in the tutorial.`
-      else if (fmt.includes('comparison') || fmt.includes('choice') || fmt.includes('before and after')) copy = `❌ The old way: ${topic}\n\n✅ The better way: The outcome you were trying to reach.`
-      else if (fmt.includes('achievement') || fmt.includes('success')) copy = `WHEN ${topic}\n\nThat tiny victory deserves a very unreasonable celebration.`
-      else if (fmt.includes('reaction')) copy = `WHEN ${topic.toUpperCase()}\n\nThat moment when it finally clicks.`
-      else copy = `SETUP\n${topic}\n\nPUNCHLINE\nThe painfully relatable detail everyone recognizes.`
-      return send(res, 200, { title: `${meme.title} · ${brand || 'Your brand'}`, copy, format: meme.format })
+      const input = await readBody(req)
+      if (!input || typeof input !== 'object' || Array.isArray(input)) return send(res, 400, { error: 'Concept details must be sent as a JSON object.' })
+      const { meme, context, brand, brandTone, audience, platform, tone } = input
+      const memeId = input.memeId || meme?.id
+      if (!memeId || typeof context !== 'string' || context.trim().length < 1 || context.length > 4000 || [brand,brandTone,audience,platform,tone].some(value => value != null && (typeof value !== 'string' || value.length > 200))) return send(res, 400, { error: 'A catalog meme and a brief of at most 4,000 characters are required.' })
+      if (typeof memeId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(memeId)) return send(res, 400, { error: 'Select a meme from the catalog.' })
+      const { rows } = await pool.query('SELECT * FROM memes WHERE id = $1', [memeId])
+      if (!rows[0]) return send(res, 404, { error: 'Selected meme was not found in the catalog.' })
+      const industry = input.industry || ''
+      if (typeof industry !== 'string' || industry.length > 200) return send(res, 400, { error: 'Industry must be at most 200 characters.' })
+      const selectedMeme = rows[0]
+      const overlaps = (values, value) => (values || []).some(item => String(value || '').toLowerCase().includes(String(item).toLowerCase()) || String(item).toLowerCase().includes(String(value || '').toLowerCase()))
+      if (selectedMeme.status === 'DEAD' || selectedMeme.brand_safe === false || (platform && selectedMeme.platforms?.length && !overlaps(selectedMeme.platforms, platform)) || (industry && overlaps(selectedMeme.industries_avoid, industry)) || overlaps(selectedMeme.avoid_situations, context)) return send(res, 409, { error: 'This meme is incompatible with the selected brief or catalog safety guidance.' })
+      const conceptInput = { meme: selectedMeme, context: context.trim(), brand: brand || '', brandTone: brandTone || '', industry, audience: audience || selectedMeme.audience || '', platform: platform || '', tone: tone || '' }
+      const scope = req.authUser?.id || hashToken(parseCookies(req)[sessionCookie] || req.socket?.remoteAddress || 'anonymous')
+      let ai
+      try { ai = await generateConceptVariations(conceptInput, { userScope: scope }) }
+      catch { console.info('signal-ai', JSON.stringify({ task:'concept', result:'fallback_guard' })); ai = { variations:null, status:'unavailable', used:false } }
+      const generated = ai.variations ? { title: ai.variations[0].title, copy: ai.variations[0].copy, format: selectedMeme.format, variations: ai.variations } : deterministicVariations(selectedMeme, conceptInput.context, conceptInput.brand)
+      return send(res, 200, { ...generated, ai: { status: ai.status, assisted: ai.used === true } })
     }
     if (req.method === 'POST' && url.pathname === '/api/memes') {
       if (!['owner','admin'].includes(req.authUser?.role)) return send(res, 403, { error:'An owner or admin account is required to edit the meme catalog.' })

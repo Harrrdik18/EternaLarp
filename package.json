@@ -13,7 +13,9 @@
     "db:seed": "node --env-file=.env scripts/seed-memes.js",
     "db:migrate:auth": "node --env-file=.env scripts/migrate-auth.js",
     "db:down": "docker compose down",
-    "db:psql": "docker compose exec db psql -U signal -d signal_studio"
+    "db:psql": "docker compose exec db psql -U signal -d signal_studio",
+    "test": "node --test",
+    "eval:memes": "node --env-file=.env scripts/evaluate-memes.js"
   },
   "dependencies": {
     "@vercel/blob": "^2.8.1",
