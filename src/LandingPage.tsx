@@ -1,8 +1,9 @@
-import { Activity, ArrowDown, ArrowRight, Check, CircleHelp, Image, MessageSquareText, Sparkles, Target } from 'lucide-react'
+import { Activity, ArrowDown, ArrowRight, Check, CircleHelp, Image, MessageSquareText, Sparkles, Target, WandSparkles } from 'lucide-react'
 
 type Props = {
   onStart: (mode: 'login' | 'signup') => void
   onFindMeme: () => void
+  onDemo: () => void
 }
 
 const steps = [
@@ -17,19 +18,19 @@ const useCases = [
   { label: 'PERSONAL BRAND', title: 'Sound like yourself online.', text: 'Find a format that carries your point without losing your voice.', tag: 'Your perspective → visual' },
 ]
 
-export default function LandingPage({ onStart, onFindMeme }: Props) {
+export default function LandingPage({ onStart, onFindMeme, onDemo }: Props) {
   return <main className="landing-page">
     <nav className="landing-nav" aria-label="Main navigation">
       <a className="landing-brand" href="#top" aria-label="Signal home"><span className="mark-icon"><Activity size={17}/></span><b>signal<span>.</span></b></a>
       <div className="landing-nav-links"><a href="#workflow">How it works</a><a href="#use-cases">Who it’s for</a></div>
-      <div className="landing-nav-actions"><button className="landing-login" onClick={()=>onStart('login')}>Sign in</button><button className="landing-cta small" onClick={()=>onStart('signup')}>Get started <ArrowRight size={14}/></button></div>
+      <div className="landing-nav-actions"><button className="landing-login" onClick={()=>onStart('login')}>Sign in</button><button className="landing-demo-link" onClick={onDemo}>Explore demo</button><button className="landing-cta small" onClick={()=>onStart('signup')}>Get started <ArrowRight size={14}/></button></div>
     </nav>
     <section className="landing-hero" id="top">
       <div className="landing-hero-copy">
         <div className="landing-eyebrow"><i/> MEME INTELLIGENCE FOR MARKETING</div>
         <h1>Find the meme.<br/><em>Make it yours.</em></h1>
         <p>Tell Signal what you're trying to say. Discover the right meme format, adapt it to your brand, and turn internet culture into content people relate to.</p>
-        <div className="landing-hero-actions"><button className="landing-cta" onClick={onFindMeme}>Find your meme <ArrowRight size={16}/></button><a href="#workflow">See how it works <ArrowDown size={15}/></a></div>
+        <div className="landing-hero-actions"><button className="landing-cta" onClick={onFindMeme}>Find your meme <ArrowRight size={16}/></button><button className="landing-demo-cta" onClick={onDemo}><WandSparkles size={15}/> Explore demo account</button><a href="#workflow">See how it works <ArrowDown size={15}/></a></div>
         <div className="landing-note"><Check size={14}/> Start with a free workspace.</div>
       </div>
       <div className="landing-preview-wrap" aria-label="Illustrative contextual meme match preview">
