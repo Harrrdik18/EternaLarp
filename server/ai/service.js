@@ -90,18 +90,21 @@ function release() { active = Math.max(0, active - 1) }
 async function generate(task, prompt, schema, validator, { userScope = 'anonymous', cacheInput, maxOutputTokens = 700 } = {}) {
   const startedAt = Date.now()
   const config = getAIConfig()
-  const unavailable = { value: null, status: config.enabled && config.order.length ? 'unavailable' : 'disabled', used: false }
+  const unavailable = { value: null, status: config.enabled && config.order.length ? 'unavailable' : 'disabled', used: false, cached: false, providerAttempts: 0, providerErrors: 0, errorCategory: null }
   if (!config.enabled || !config.order.length) return { ...unavailable, latencyMs: 0 }
   const cacheKey = hash({ version: PROMPT_VERSION, task, userScope, cacheInput, providers: config.order.map(name => [name, config.configs[name].model]) })
   const cached = getCached(cacheKey, config.cacheTtlMs)
-  if (cached) { logEvent({ task, cacheHit: true, result: 'success' }); return { value: cached, status: 'used', used: true, cached: true, latencyMs: 0 } }
+  if (cached) { logEvent({ task, cacheHit: true, result: 'success' }); return { value: cached, status: 'used', used: true, cached: true, providerAttempts: 0, providerErrors: 0, errorCategory: null, latencyMs: 0 } }
   const withinLimit = withinUserLimit(userScope, config.maxRequestsPerWindow)
   const acquired = withinLimit && acquire()
   if (!acquired) {
     logEvent({ task, cacheHit: false, result: !withinLimit ? 'rate_limited_local' : 'concurrency_limited' })
-    return { ...unavailable, status: 'limited', latencyMs: Date.now() - startedAt }
+    return { ...unavailable, status: 'limited', errorCategory: !withinLimit ? 'local_rate_limit' : 'local_concurrency_limit', latencyMs: Date.now() - startedAt }
   }
   try {
+    let providerAttempts = 0
+    let providerErrors = 0
+    let errorCategory = null
     for (const provider of config.order) {
       if (Date.now() >= startedAt + config.totalTimeoutMs) break
       const credentials = config.configs[provider]
@@ -113,6 +116,7 @@ async function generate(task, prompt, schema, validator, { userScope = 'anonymou
         const remainingMs = startedAt + config.totalTimeoutMs - Date.now()
         if (remainingMs <= 0) break
         const started = Date.now()
+        providerAttempts += 1
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), Math.min(config.timeoutMs, remainingMs))
         try {
@@ -120,9 +124,11 @@ async function generate(task, prompt, schema, validator, { userScope = 'anonymou
           const value = validator(raw)
           setCached(cacheKey, value, config.cacheTtlMs)
           logEvent({ provider, model: credentials.model, task, latencyMs: Date.now() - started, result: 'success', retryCount: retry, cacheHit: false })
-          return { value, status: 'used', used: true, provider, retryCount: retry, latencyMs: Date.now() - startedAt }
+          return { value, status: 'used', used: true, cached: false, provider, retryCount: retry, providerAttempts, providerErrors, errorCategory, providerLatencyMs: Date.now() - started, latencyMs: Date.now() - startedAt }
         } catch (error) {
           const normalized = error instanceof AIProviderError ? error : error?.name === 'AbortError' ? new AIProviderError('timeout', { retryable: true }) : new AIProviderError('network', { retryable: true })
+          providerErrors += 1
+          errorCategory = normalized.category
           logEvent({ provider, model: credentials.model, task, latencyMs: Date.now() - started, result: normalized.category, retryCount: retry, cacheHit: false })
           if (normalized.retryable && retry < config.retries) {
             if (normalized.retryAfterMs) await new Promise(resolve => setTimeout(resolve, normalized.retryAfterMs))
@@ -132,11 +138,15 @@ async function generate(task, prompt, schema, validator, { userScope = 'anonymou
         } finally { clearTimeout(timer) }
       }
     }
-    return { ...unavailable, latencyMs: Date.now() - startedAt }
+    return { ...unavailable, providerAttempts, providerErrors, errorCategory, latencyMs: Date.now() - startedAt }
   } finally { release() }
 }
 
-function explicitWins(input, inferred, key) { return clean(input[key]) || inferred[key] || '' }
+function explicitWins(input, inferred, key) {
+  // Structured user fields remain authoritative. Do not let a model fill an
+  // empty audience/platform/industry/tone with a guess that changes matching.
+  return clean(input[key])
+}
 
 export async function interpretContext(input, options = {}) {
   const text = [input.context, input.goal, input.audience, input.industry].filter(Boolean).join('\n')
@@ -144,9 +154,9 @@ export async function interpretContext(input, options = {}) {
   const fields = ['audience', 'tone', 'platform', 'industry'].map(key => `${key}: ${input[key] || '(not supplied; leave blank unless directly stated)'}`).join('\n')
   const prompt = `Interpret the user's meme brief for a deterministic catalog matcher. Infer communication pattern from meaning, not keyword listing. Never invent specific audience, platform, or industry when absent. Return empty strings for unknown fields. Preserve the meaning of all explicit fields. Allowed pattern labels include comparison, choice, contrast, expectation_vs_reality, frustration, surprise, achievement, failure, relatable_struggle, relatable_experience, product_comparison, educational_content, announcement, storytelling, reaction, before_after, escalation.\nUser brief: ${text.slice(0, 4000)}\nExplicit structured fields:\n${fields}\nReturn topic, intent, communicationPatterns, audience, tone, platform, industry.`
   const result = await generate('interpretation', prompt, interpretationSchema, validateInterpretation, { ...options, cacheInput: { input, userScope: options.userScope }, maxOutputTokens: 350 })
-  if (!result.value) return { interpretation: null, status: result.status, used: false, provider: result.provider, retryCount: result.retryCount || 0, latencyMs: result.latencyMs }
+  if (!result.value) return { interpretation: null, status: result.status, used: false, provider: result.provider, retryCount: result.retryCount || 0, cached: result.cached || false, providerAttempts: result.providerAttempts || 0, providerErrors: result.providerErrors || 0, errorCategory: result.errorCategory || null, providerLatencyMs: result.providerLatencyMs ?? null, latencyMs: result.latencyMs }
   const inferred = result.value
-  return { interpretation: { ...inferred, audience: explicitWins(input, inferred, 'audience'), tone: explicitWins(input, inferred, 'tone'), platform: explicitWins(input, inferred, 'platform'), industry: explicitWins(input, inferred, 'industry') }, status: result.status, used: true, provider: result.provider, retryCount: result.retryCount || 0, latencyMs: result.latencyMs }
+  return { interpretation: { ...inferred, audience: explicitWins(input, inferred, 'audience'), tone: explicitWins(input, inferred, 'tone'), platform: explicitWins(input, inferred, 'platform'), industry: explicitWins(input, inferred, 'industry') }, status: result.status, used: true, provider: result.provider, retryCount: result.retryCount || 0, cached: result.cached || false, providerAttempts: result.providerAttempts || 0, providerErrors: result.providerErrors || 0, errorCategory: result.errorCategory || null, providerLatencyMs: result.providerLatencyMs ?? null, latencyMs: result.latencyMs }
 }
 
 export async function generateConceptVariations(input, options = {}) {
@@ -155,16 +165,19 @@ export async function generateConceptVariations(input, options = {}) {
   const format = `${meme.format || ''} ${(meme.content_formats || []).join(' ')}`.toLowerCase()
   const validateForFormat = raw => {
     const variations = validateConcepts(raw)
+    const briefNumbers = new Set(input.context.match(/\b\d+(?:[.,]\d+)?%?\b/g) || [])
+    if (variations.some(item => (item.copy.match(/\b\d+(?:[.,]\d+)?%?\b/g) || []).some(number => !briefNumbers.has(number)))) throw new AIProviderError('invalid_output', { retryable: true })
     const followsStructure = variations.every(item => {
       if (/expectation|reality/.test(format)) return /expectation/i.test(item.copy) && /reality/i.test(item.copy)
       if (/starter pack/.test(format)) return (item.copy.match(/(?:^|\n)\s*(?:[-*•]|\d+[.)])/g) || []).length >= 2
       if (/choice|comparison|before and after/.test(format)) return /(?:✖|❌|reject|instead|old way|before)[\s\S]*(?:✔|✅|approve|choose|new way|after)/i.test(item.copy) || item.copy.split(/\n\s*\n/).length >= 2
+      if (/reaction|frustration|fail/.test(format)) return item.copy.split(/\n\s*\n/).filter(part => part.trim()).length >= 2
       return true
     })
     if (!followsStructure) throw new AIProviderError('invalid_output', { retryable: true })
     return variations
   }
-  const prompt = `Create exactly three editable meme copy variations for the supplied catalog format. Types must be relatable, funny, promotional. Follow the template structure stated by format, and do not force a two-part layout unless the format uses one. Platform: ${input.platform || '(unspecified)'}; audience: ${input.audience || '(unspecified)'}; desired tone: ${input.tone || '(unspecified)'}; brand tone: ${input.brandTone || '(unspecified)'}; brand context: ${input.brand || '(none)'}; industry: ${input.industry || '(unspecified)'}. User context: ${input.context.slice(0, 4000)}. Selected catalog meme metadata: ${JSON.stringify(metadata)}. Do not invent claims, numbers, product capabilities, audiences, or live-trend facts. Keep copy concise and suitable for the platform. Respect avoid_situations and safety metadata. Return variations [{type,title,copy}].`
+  const prompt = `Create exactly three editable meme copy variations for the supplied catalog format. Types must be relatable, funny, promotional. Follow the template structure stated by format: expectation/reality must label both parts; choice/comparison must show both alternatives; starter pack must use a list; reaction/frustration must have a setup paragraph and a distinct response paragraph. Do not force a two-part layout unless the format uses one. Platform: ${input.platform || '(unspecified)'}; audience: ${input.audience || '(unspecified)'}; desired tone: ${input.tone || '(unspecified)'}; brand tone: ${input.brandTone || '(unspecified)'}; brand context: ${input.brand || '(none)'}; industry: ${input.industry || '(unspecified)'}. User context: ${input.context.slice(0, 4000)}. Selected catalog meme metadata: ${JSON.stringify(metadata)}. Do not invent claims, numbers, product capabilities, audiences, or live-trend facts. Keep copy concise and suitable for the platform. Respect avoid_situations and safety metadata. Return variations [{type,title,copy}].`
   const result = await generate('concept', prompt, conceptSchema, validateForFormat, { ...options, cacheInput: { meme: metadata, context: input.context, platform: input.platform || '', audience: input.audience || '', tone: input.tone || '', brandTone: input.brandTone || '', brand: input.brand || '', industry: input.industry || '', userScope: options.userScope }, maxOutputTokens: 900 })
   return { variations: result.value, status: result.status, used: result.used || false }
 }

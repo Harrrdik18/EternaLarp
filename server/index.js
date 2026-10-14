@@ -8,6 +8,7 @@ import { Pool } from 'pg'
 import { generateConcept, matchMemesIntentFreshness } from './meme-matcher.js'
 import { interpretContext, generateConceptVariations } from './ai/service.js'
 import { deterministicVariations } from './ai/concept-fallback.js'
+import { canAccessCreativeStrategy, generateAdIdeas, rankCreativeFormats } from './creative-engine.js'
 
 const port = Number(process.env.API_PORT || 3001)
 const password = process.env.POSTGRES_PASSWORD
@@ -143,6 +144,11 @@ export async function handleApiRequest(req, res) {
       const user = await authenticatedUser(req)
       return send(res, 200, { user: user ? publicUser(user) : null })
     }
+    if (req.method === 'GET' && url.pathname === '/api/demo/catalog') {
+      const { rows } = await pool.query(`SELECT id,title,format,category,description,platforms,audience
+        FROM memes WHERE brand_safe = true AND status <> 'DEAD' ORDER BY title ASC LIMIT 100`)
+      return send(res, 200, { formats:rows, source:'curated meme catalog', count:rows.length })
+    }
     if (req.method === 'POST' && url.pathname === '/api/auth/signup') {
       const input = await readBody(req)
       const displayName = String(input.displayName || '').trim()
@@ -218,6 +224,25 @@ export async function handleApiRequest(req, res) {
           AND ($3::text IS NULL OR $3 = ANY(platforms))
         ORDER BY momentum DESC, updated_at DESC, title ASC`, [query, status, platform])
       return send(res, 200, rows)
+    }
+    if (req.method === 'POST' && url.pathname === '/api/creative/formats') {
+      if (!canAccessCreativeStrategy(req.authUser)) return send(res, 401, { error:'Sign in to use Creative Strategy.' })
+      const input = await readBody(req)
+      if (typeof (input.message || input.context) !== 'string' || (input.message || input.context).trim().length < 8 || (input.message || input.context).length > 4000) return send(res, 400, { error:'Describe what you want to communicate in 8 to 4,000 characters.' })
+      const { rows } = await pool.query("SELECT * FROM memes WHERE status <> 'DEAD' ORDER BY id LIMIT 300")
+      const brief={context:(input.message || input.context).trim(),audience:input.audience || '',goal:input.goal || '',platform:input.platform || '',tone:input.tone || '',industry:input.industry || ''}
+      const memeMatches=matchMemesIntentFreshness(brief,rows,5).map(match=>({id:match.meme.id,name:match.meme.title,type:'meme-format',score:20+match.score*.5,explanation:match.reasons.join(' '),cautions:match.cautions,platforms:match.meme.platforms||[],meme:match.meme}))
+      const recommendations=[...rankCreativeFormats({...input,message:brief.context},[]),...memeMatches].sort((a,b)=>b.score-a.score || a.name.localeCompare(b.name)).slice(0,10)
+      return send(res, 200, { recommendations, ranking:'deterministic-metadata', ai:{status:'deterministic'} })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/creative/ads') {
+      if (!canAccessCreativeStrategy(req.authUser)) return send(res, 401, { error:'Sign in to use Creative Strategy.' })
+      const input = await readBody(req)
+      if (typeof input.product !== 'string' || input.product.trim().length < 2 || input.product.length > 500) return send(res, 400, { error:'Enter a product or offer in 2 to 500 characters.' })
+      for (const key of ['audience','objective','platform','tone','brandContext','offer','storyFacts']) if (input[key] != null && (typeof input[key] !== 'string' || input[key].length > 1000)) return send(res, 400, { error:`${key} must be text under 1,000 characters.` })
+      for (const key of ['proofPoints','approvedClaims','restrictions']) if (input[key] != null && (!Array.isArray(input[key]) || input[key].length > 20 || input[key].some(value=>typeof value !== 'string' || value.length > 500))) return send(res, 400, { error:`${key} must be a list of up to 20 text items.` })
+      const ideas = generateAdIdeas(input)
+      return send(res, 200, { ideas, ai:{status:'deterministic'}, notice:'Draft ideas use only supplied proof points; verify claims before publishing.' })
     }
     if (req.method === 'POST' && url.pathname === '/api/memes/match') {
       const input = await readBody(req)

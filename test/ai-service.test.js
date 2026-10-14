@@ -57,7 +57,7 @@ test('provider fallback and invalid output validation preserve user supplied fie
   providerAdapters.groq=async()=>{groqCalls++;return {...validInterpretation,topic:'creator learning curve',audience:'invented audience',tone:'chaotic',platform:'TikTok',industry:'invented industry'}}
   try {
     const result=await interpretContext({context:'A beginner creator makes a mistake',audience:'My subscribers',tone:'Relatable',platform:'Instagram',industry:''},{userScope:'user-a'})
-    assert.equal(result.used,true);assert.equal(result.interpretation.audience,'My subscribers');assert.equal(result.interpretation.tone,'Relatable');assert.equal(result.interpretation.platform,'Instagram');assert.equal(result.interpretation.industry,'invented industry');assert.equal(groqCalls,1)
+    assert.equal(result.used,true);assert.equal(result.interpretation.audience,'My subscribers');assert.equal(result.interpretation.tone,'Relatable');assert.equal(result.interpretation.platform,'Instagram');assert.equal(result.interpretation.industry,'');assert.equal(groqCalls,1);assert.equal(result.providerAttempts,2);assert.equal(result.providerErrors,1);assert.equal(result.errorCategory,'rate_limit')
   } finally { providerAdapters.gemini=gemini;providerAdapters.groq=groq }
 })
 
@@ -101,9 +101,53 @@ test('interpretation cache separates tenants and includes structured context',as
   providerAdapters.gemini=async()=>{count++;return validInterpretation}
   try {
     const brief={context:'Same private brief',audience:'',tone:'',platform:'',industry:''}
-    await interpretContext(brief,{userScope:'tenant-a'});await interpretContext(brief,{userScope:'tenant-a'});await interpretContext(brief,{userScope:'tenant-b'});await interpretContext({...brief,platform:'LinkedIn'},{userScope:'tenant-a'})
+    await interpretContext(brief,{userScope:'tenant-a'});const cached=await interpretContext(brief,{userScope:'tenant-a'});await interpretContext(brief,{userScope:'tenant-b'});await interpretContext({...brief,platform:'LinkedIn'},{userScope:'tenant-a'})
+    assert.equal(cached.cached,true);assert.equal(cached.providerAttempts,0)
     assert.equal(count,3)
   } finally { providerAdapters.gemini=original }
+})
+
+test('missing structured constraints are not invented from model output',async()=>{
+  configureAI({fallback:''})
+  const original=providerAdapters.gemini
+  providerAdapters.gemini=async()=>({...validInterpretation,audience:'guessed audience',tone:'guessed tone',platform:'TikTok',industry:'guessed industry'})
+  try {
+    const result=await interpretContext({context:'A brief without audience or platform details'},{userScope:'blank-fields'})
+    assert.deepEqual({audience:result.interpretation.audience,tone:result.interpretation.tone,platform:result.interpretation.platform,industry:result.interpretation.industry},{audience:'',tone:'',platform:'',industry:''})
+  } finally { providerAdapters.gemini=original }
+})
+
+test('concept requests carry platform and tone while deterministic structures stay format-specific',async()=>{
+  const formats=[
+    [{title:'Choice',format:'Choice between alternatives',content_formats:['choice']},/✖[\s\S]*✔/],
+    [{title:'Expectation',format:'Expectation vs reality',content_formats:['expectation','reality']},/EXPECTATION[\s\S]*REALITY/],
+    [{title:'Starter pack',format:'Starter pack',content_formats:['starter pack']},/STARTER PACK[\s\S]*•[\s\S]*•/],
+    [{title:'Reaction',format:'Reaction',content_formats:['reaction']},/WHEN[\s\S]*\n\n/],
+  ]
+  for(const [meme,pattern] of formats){
+    const fallback=deterministicVariations(meme,'A familiar workflow moment', 'Studio')
+    assert.equal(fallback.variations.length,3);assert.match(fallback.variations[0].copy,pattern)
+  }
+  configureAI({fallback:''})
+  const original=providerAdapters.gemini;let prompt=''
+  try {
+    providerAdapters.gemini=async request=>{prompt=request.prompt;return {variations:[{type:'relatable',title:'One',copy:'WHEN the upload fails.\n\nThat familiar creator reaction.'},{type:'funny',title:'Two',copy:'WHEN the upload fails again.\n\nThe familiar retry.'},{type:'promotional',title:'Three',copy:'WHEN the upload fails.\n\nMention a verified tool detail here.'}]}}
+    const result=await generateConceptVariations({meme:{title:'Reaction',format:'Reaction',content_formats:['reaction']},context:'Creator reacts to a failed upload',platform:'Instagram',tone:'Wholesome',audience:'Creators'}, {userScope:'format-prompt'})
+    assert.equal(result.variations.length,3)
+    assert.match(prompt,/Platform: Instagram/);assert.match(prompt,/desired tone: Wholesome/);assert.match(prompt,/Do not invent claims/)
+  } finally {providerAdapters.gemini=original}
+})
+
+test('concept output with unsupported numeric claims is rejected for deterministic fallback',async()=>{
+  configureAI({fallback:''})
+  const original=providerAdapters.gemini
+  providerAdapters.gemini=async()=>({variations:[{type:'relatable',title:'One',copy:'We saved 10 hours.'},{type:'funny',title:'Two',copy:'We saved 10 hours again.'},{type:'promotional',title:'Three',copy:'We saved 10 hours every week.'}]})
+  try {
+    const result=await generateConceptVariations({meme:{title:'Two choices',format:'Choice',content_formats:['choice']},context:'We reduced the wait from 20 minutes to 2 minutes',platform:'LinkedIn',tone:'Relatable'},{userScope:'unsupported-claim'})
+    assert.equal(result.variations,null);assert.equal(result.status,'unavailable')
+    const safeFallback=deterministicVariations({title:'Two choices',format:'Choice',content_formats:['choice']},'We reduced the wait from 20 minutes to 2 minutes')
+    assert.equal(safeFallback.variations.length,3);assert.doesNotMatch(safeFallback.variations[0].copy,/10 hours/)
+  } finally {providerAdapters.gemini=original}
 })
 
 test('concept cache keys include platform, brand, and selected meme metadata',async()=>{

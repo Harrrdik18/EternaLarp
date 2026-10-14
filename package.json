@@ -15,7 +15,8 @@
     "db:down": "docker compose down",
     "db:psql": "docker compose exec db psql -U signal -d signal_studio",
     "test": "node --test",
-    "eval:memes": "node --env-file=.env scripts/evaluate-memes.js"
+    "eval:memes": "node --env-file=.env scripts/evaluate-memes.js",
+    "eval:creative": "node scripts/evaluate-creative.js"
   },
   "dependencies": {
     "@vercel/blob": "^2.8.1",
